@@ -247,7 +247,7 @@ def index():
     return jsonify({
         "service": "tasker",
         "version": "0.3.0",
-        "message": "Tasker con persistenza Postgres",
+        "message": "Tasker pipeline live — saluti da Breaking Prod EP7",
         "endpoints": {
             "GET /health": "health check (include stato DB)",
             "GET /tasks": "list all tasks",
