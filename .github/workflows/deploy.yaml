@@ -156,3 +156,4 @@ jobs:
             echo "- **Cluster**: \`${{ env.EKS_CLUSTER_NAME }}\` (${{ env.AWS_REGION }})"
             echo "- **Triggered by**: \`${{ github.event_name }}\` from \`${{ github.actor }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
