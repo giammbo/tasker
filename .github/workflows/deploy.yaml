@@ -1,0 +1,158 @@
+# GitHub Actions workflow per Tasker.
+# Da git push su main, builda l'immagine arm64 (Graviton), la pusha su ECR
+# con tag = SHA del commit, e aggiorna il deployment su EKS.
+#
+# Autenticazione AWS: OIDC federation. NESSUNA chiave AWS statica nei Secrets
+# di GitHub. Il workflow assume il ruolo BreakingProdGitHubActionsRole, che
+# si fida solo dei push sul branch main di questo repository.
+
+name: Deploy Tasker to EKS
+
+on:
+  # Parte automaticamente su push a main, ma solo se cambiano file rilevanti.
+  # Cosi un README aggiornato non scatena un build inutile.
+  push:
+    branches:
+      - main
+    paths:
+      - 'app.py'
+      - 'requirements.txt'
+      - 'Dockerfile'
+      - 'tasker-deployment-eks.yaml'
+      - '.github/workflows/deploy.yaml'
+  # Bottone "Run workflow" manuale dalla UI di GitHub Actions.
+  # Comodo per re-deploy senza commit, o per il primo run di test.
+  workflow_dispatch: {}
+
+# Permessi del workflow.
+# id-token: write e' OBBLIGATORIO per OIDC - senza, GitHub non rilascia il
+# JWT che ci serve per autenticarsi su AWS.
+# contents: read serve per actions/checkout.
+permissions:
+  id-token: write
+  contents: read
+
+# Evita che due push ravvicinati partano in parallelo e si pestino i piedi.
+# Se arriva un nuovo run mentre uno e' in corso, il precedente NON viene
+# annullato (annullare un deploy a meta' sarebbe peggio): il nuovo aspetta.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: eu-west-1
+  EKS_CLUSTER_NAME: tasker-eks
+  ECR_REPOSITORY: tasker
+  # Sostituisci con l'ARN del tuo IAM role per OIDC.
+  AWS_ROLE_ARN: arn:aws:iam::405894862385:role/BreakingProdGitHubActionsRole
+
+jobs:
+  deploy:
+    name: Build, push and deploy
+    runs-on: ubuntu-latest
+    # Tip: per build arm64 nativo (senza emulazione QEMU) usa:
+    # runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+
+    steps:
+      # 1. Checkout del codice.
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. OIDC: ottieni credenziali AWS temporanee assumendo il role.
+      #    Nessuna access key qui dentro: il token JWT lo fornisce GitHub,
+      #    AWS STS lo verifica contro la trust policy del role.
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          # Tag visibile in CloudTrail: utile per audit ("chi ha deployato cosa")
+          role-session-name: github-actions-${{ github.run_id }}
+
+      # 3. Login su Amazon ECR (usa le credenziali appena ottenute via OIDC).
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # 4. Setup buildx per il build multi-arch.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 5. Build dell'immagine arm64 (per i nodi Graviton del cluster) e push
+      #    su ECR. Il tag e' il SHA del commit: ogni deploy ha un'immagine
+      #    immutabile e tracciabile fino al commit esatto.
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/arm64
+          push: true
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+          # Cache dei layer su GitHub: i build successivi sono molto piu' veloci.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # 6. Configura kubectl per il cluster EKS.
+      #    Richiede che il role abbia eks:DescribeCluster e che esista una
+      #    EKS Access Entry per il role (lato Kubernetes RBAC).
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ env.EKS_CLUSTER_NAME }} \
+            --region ${{ env.AWS_REGION }}
+          kubectl version --client
+          kubectl get nodes
+
+      # 7. Aggiorna l'immagine del deployment Tasker e aspetta il rollout.
+      #    kubectl set image cambia SOLO il tag, niente apply del manifest:
+      #    pulito per i deploy di update.
+      - name: Deploy to EKS
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}"
+          echo "Deploying image: ${IMAGE}"
+          kubectl set image deployment/tasker tasker="${IMAGE}"
+          kubectl rollout status deployment/tasker --timeout=5m
+
+      # 8. Smoke test: l'app risponde davvero dopo il deploy?
+      #    Se /health non ritorna "ok", il workflow fallisce e siamo avvisati
+      #    prima degli utenti. Le readinessProbe (EP6) impediscono comunque
+      #    che pod rotti ricevano traffico - questa e' una rete in piu'.
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          ELB=$(kubectl get svc tasker-service \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          if [ -z "${ELB}" ]; then
+            echo "ELB hostname non disponibile" >&2
+            exit 1
+          fi
+          echo "Testing http://${ELB}/health"
+          for i in 1 2 3 4 5; do
+            response=$(curl -fsS "http://${ELB}/health" || true)
+            echo "Attempt ${i}: ${response}"
+            if echo "${response}" | grep -q '"status":"ok"'; then
+              echo "Smoke test OK"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Smoke test failed dopo 5 tentativi" >&2
+          exit 1
+
+      # 9. Riepilogo nella UI di GitHub Actions: cosa e' stato deployato.
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Deploy summary"
+            echo ""
+            echo "- **Commit**: \`${{ github.sha }}\`"
+            echo "- **Image**: \`${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}\`"
+            echo "- **Cluster**: \`${{ env.EKS_CLUSTER_NAME }}\` (${{ env.AWS_REGION }})"
+            echo "- **Triggered by**: \`${{ github.event_name }}\` from \`${{ github.actor }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

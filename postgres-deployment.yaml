@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  labels:
+    app: postgres
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      serviceAccountName: postgres-sa
+      containers:
+      - name: postgres
+        image: postgres:16-alpine
+        ports:
+        - containerPort: 5432
+        # Le variabili non-segrete (host, db, user) arrivano dalla ConfigMap.
+        envFrom:
+          - configMapRef:
+              name: postgres-config
+        # La password NON arriva da un Secret K8s.
+        # POSTGRES_PASSWORD_FILE dice a Postgres di leggerla dal file montato
+        # dal Secrets Store CSI Driver. Cosi non c'e' dipendenza circolare:
+        # il pod non ha bisogno di un Secret K8s per partire, gli basta il
+        # volume CSI - che monta sempre, a prescindere dall'ordine di apply.
+        env:
+          - name: POSTGRES_PASSWORD_FILE
+            value: /mnt/secrets-store/POSTGRES_PASSWORD
+        # resources: requests = quota garantita usata dallo scheduler per
+        # piazzare il pod; limits = tetto massimo (oltre limits.memory il
+        # container viene OOMKilled, oltre limits.cpu viene throttled).
+        # Valori prudenti per la demo: un Postgres di produzione vuole
+        # molta piu' memoria.
+        resources:
+          requests:
+            cpu: 250m
+            memory: 256Mi
+          limits:
+            cpu: "1"
+            memory: 512Mi
+        volumeMounts:
+        - name: postgres-storage
+          mountPath: /var/lib/postgresql/data
+          subPath: pgdata
+        - name: secrets-store
+          mountPath: /mnt/secrets-store
+          readOnly: true
+      volumes:
+      - name: postgres-storage
+        persistentVolumeClaim:
+          claimName: postgres-pvc
+      - name: secrets-store
+        csi:
+          driver: secrets-store.csi.k8s.io
+          readOnly: true
+          volumeAttributes:
+            secretProviderClass: "postgres-secret-provider"

@@ -1,0 +1,33 @@
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: postgres-cluster
+spec:
+  instances: 3
+  imageName: ghcr.io/cloudnative-pg/postgresql:16
+  bootstrap:
+    initdb:
+      database: tasker
+      owner: tasker
+      secret:
+        name: tasker-db-credentials
+  storage:
+    size: 5Gi
+    storageClass: gp3
+  walStorage:
+    size: 2Gi
+    storageClass: gp3
+  affinity:
+    topologyKey: topology.kubernetes.io/zone
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  primaryUpdateStrategy: unsupervised
+  postgresql:
+    parameters:
+      max_connections: "100"
+      shared_buffers: "128MB"
