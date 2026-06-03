@@ -1,0 +1,84 @@
+# Deployment BLUE di Tasker (versione attualmente live).
+# Per la demo blue/green a mano della EP8.
+# Identico al green tranne la label `version: blue` e (eventualmente) il tag immagine.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tasker-blue
+  labels:
+    app: tasker
+    version: blue
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: tasker
+      version: blue
+  template:
+    metadata:
+      labels:
+        app: tasker
+        version: blue
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: tasker
+              version: blue
+      serviceAccountName: tasker-sa
+      containers:
+      - name: tasker
+        image: 405894862385.dkr.ecr.eu-west-1.amazonaws.com/tasker:0.3.5
+        ports:
+        - containerPort: 5000
+        env:
+          - name: APP_VERSION
+            value: 0.3.5-blue
+          - name: POSTGRES_HOST
+            valueFrom:
+              configMapKeyRef:
+                name: postgres-config
+                key: POSTGRES_HOST
+          - name: POSTGRES_PORT
+            valueFrom:
+              configMapKeyRef:
+                name: postgres-config
+                key: POSTGRES_PORT
+          - name: POSTGRES_DB
+            valueFrom:
+              configMapKeyRef:
+                name: postgres-config
+                key: POSTGRES_DB
+          - name: POSTGRES_USER
+            valueFrom:
+              configMapKeyRef:
+                name: postgres-config
+                key: POSTGRES_USER
+          - name: POSTGRES_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: tasker-db-credentials
+                key: password
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 5000
+          periodSeconds: 5
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 5000
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          failureThreshold: 3

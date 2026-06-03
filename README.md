@@ -2,7 +2,8 @@
 
 API REST minimale per gestire una lista di task, scritta in Python/Flask con
 persistenza su PostgreSQL. Pensata per essere deployata su Kubernetes (AWS EKS)
-in alta disponibilità, con pipeline CI/CD via GitHub Actions.
+in alta disponibilità, con pipeline CI/CD via GitHub Actions e deploy
+progressivi (canary) via Argo Rollouts.
 
 ## Stack
 
@@ -11,6 +12,7 @@ in alta disponibilità, con pipeline CI/CD via GitHub Actions.
 - **Docker** · immagine multi-arch, deploy arm64 su AWS Graviton
 - **Kubernetes (AWS EKS)** · deploy in produzione
 - **GitHub Actions** · CI/CD con autenticazione OIDC su AWS (no chiavi statiche)
+- **Argo Rollouts** · deploy progressivi (canary) con avanzamento controllato
 
 ## Endpoint
 
@@ -48,15 +50,22 @@ come variabile d'ambiente o come Secret Kubernetes sincronizzato.
 ├── postgres-secretproviderclass.yaml
 ├── postgres-serviceaccount.yaml
 │
-├── tasker-deployment-eks.yaml      # Deployment Tasker (3 repliche, HA, probe)
-├── tasker-hpa.yaml                 # HorizontalPodAutoscaler
+├── tasker-deployment-eks.yaml      # Deployment Tasker (alternativa al Rollout)
+├── tasker-rollout-argo.yaml        # Rollout Argo (canary) — modo di deploy attuale
+├── tasker-hpa.yaml                 # HorizontalPodAutoscaler (target: Rollout)
 ├── tasker-pdb.yaml                 # PodDisruptionBudget
 ├── tasker-service-loadbalancer-eks.yaml
 ├── tasker-serviceaccount.yaml
 ├── storageclass-gp3.yaml           # StorageClass EBS gp3 default
 │
-└── .github/workflows/deploy.yaml   # pipeline CI/CD GitHub Actions
+└── .github/workflows/deploy.yaml   # pipeline CI/CD GitHub Actions (canary)
 ```
+
+**Nota su Deployment vs Rollout**: `tasker-deployment-eks.yaml` (Deployment
+classico) e `tasker-rollout-argo.yaml` (Rollout di Argo Rollouts) sono due modi
+alternativi di gestire lo stesso workload `tasker` — **non vanno applicati
+insieme**. Il modo di deploy attuale è il Rollout (deploy progressivo canary).
+Il Deployment resta come riferimento del setup pre-Argo Rollouts.
 
 ## Avvio in locale
 
@@ -77,21 +86,43 @@ docker buildx build --platform linux/arm64 -t tasker:dev --load .
 
 ## Deploy su Kubernetes
 
-Vedi i manifest YAML in radice. Ordine consigliato di apply:
+Prerequisito per il Rollout: il controller Argo Rollouts installato nel cluster.
+
+```bash
+kubectl create namespace argo-rollouts
+kubectl apply -n argo-rollouts \
+  -f https://github.com/argoproj/argo-rollouts/releases/latest/download/install.yaml
+```
+
+Ordine consigliato di apply:
 
 1. `*-serviceaccount.yaml`
 2. `storageclass-gp3.yaml`, `postgres-configmap.yaml`
 3. `postgres-secretproviderclass.yaml`
-4. Database: `postgres-*.yaml` (single-pod) **oppure** `postgres-cluster-cnpg.yaml`
-5. `postgres-service.yaml`
-6. `tasker-deployment-eks.yaml`, `tasker-pdb.yaml`, `tasker-hpa.yaml`
+4. Database: `postgres-cluster-cnpg.yaml` (richiede il Secret `tasker-db-credentials`)
+5. `tasker-rollout-argo.yaml` (Rollout canary) — **oppure** `tasker-deployment-eks.yaml` (Deployment classico)
+6. `tasker-pdb.yaml`, `tasker-hpa.yaml`
 7. `tasker-service-loadbalancer-eks.yaml`
+
+Avanzamento e controllo del canary:
+
+```bash
+kubectl argo rollouts get rollout tasker --watch   # stato live
+kubectl argo rollouts promote tasker               # promuovi al passo successivo
+kubectl argo rollouts abort tasker                 # rollback alla versione stabile
+```
 
 ## CI/CD
 
 `.github/workflows/deploy.yaml` builda l'immagine arm64, la pusha su ECR con
-tag = SHA del commit, e aggiorna il deployment su EKS. L'autenticazione su
-AWS avviene via OIDC federation: nessuna chiave statica nei Secrets di GitHub.
+tag = SHA del commit, e avvia un deploy canary sul Rollout via
+`kubectl argo rollouts set image`. L'autenticazione su AWS avviene via OIDC
+federation: nessuna chiave statica nei Secrets di GitHub.
+
+La pipeline porta il canary fino al punto di pausa e verifica che sia sano
+(pod canary healthy + smoke test). La **promozione finale al 100% è manuale**
+(`kubectl argo rollouts promote tasker`): è una scelta deliberata, l'umano
+decide se completare il rilascio dopo aver osservato il canary.
 
 Setup AWS (IAM role OIDC, EKS Access Entry) e materiali editoriali della serie
 sono in `~/Repository/personal/BreakingProd-materiali/`.

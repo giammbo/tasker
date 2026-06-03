@@ -1,0 +1,116 @@
+# Rollout di Tasker per Argo Rollouts (strategia canary).
+#
+# Sostituisce il Deployment tradizionale (tasker-deployment-eks.yaml).
+# kind: Rollout invece di Deployment. Il template del pod e' IDENTICO al
+# Deployment EP6/EP7: stesse env, stesse probe, stesse resources.
+# L'unica differenza e' la sezione strategy.canary.
+#
+# IMPORTANTE: sostituisci <ACCOUNT_ID> se necessario (qui 405894862385).
+#
+# Migrazione dal Deployment:
+#   kubectl delete deployment tasker
+#   kubectl apply -f tasker-rollout-argo.yaml
+#   kubectl apply -f tasker-service-loadbalancer-eks.yaml   (Service invariato)
+#
+# NOTA sul peso (canary senza traffic router):
+# Senza un traffic router (ALB Ingress / Istio / NGINX), il "peso" e'
+# approssimato dal NUMERO DI REPLICHE. Con replicas: 5 e setWeight: 20,
+# Argo Rollouts tiene 1 pod canary e 4 stabili; il traffico si divide in
+# modo grossolano via kube-proxy. Per pesi di traffico precisi serve un
+# traffic router (tema avanzato).
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: tasker
+  labels:
+    app: tasker
+spec:
+  replicas: 3
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: tasker
+  strategy:
+    canary:
+      steps:
+        # 20% della flotta diventa la versione nuova, poi aspetta 30s.
+        - setWeight: 20
+        - pause: {duration: 30s}
+        # 50%, poi pausa INDEFINITA: avanza solo con
+        # `kubectl argo rollouts promote tasker`.
+        - setWeight: 50
+        - pause: {}
+        # promozione finale al 100%.
+        - setWeight: 100
+  template:
+    metadata:
+      labels:
+        app: tasker
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: tasker
+      serviceAccountName: tasker-sa
+      containers:
+      - name: tasker
+        image: 405894862385.dkr.ecr.eu-west-1.amazonaws.com/tasker:0.3.8
+        ports:
+        - containerPort: 5000
+        env:
+          - name: APP_VERSION
+            value: 0.3.8
+          - name: POSTGRES_HOST
+            valueFrom:
+              configMapKeyRef:
+                name: postgres-config
+                key: POSTGRES_HOST
+          - name: POSTGRES_PORT
+            valueFrom:
+              configMapKeyRef:
+                name: postgres-config
+                key: POSTGRES_PORT
+          - name: POSTGRES_DB
+            valueFrom:
+              configMapKeyRef:
+                name: postgres-config
+                key: POSTGRES_DB
+          - name: POSTGRES_USER
+            valueFrom:
+              configMapKeyRef:
+                name: postgres-config
+                key: POSTGRES_USER
+          - name: POSTGRES_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: tasker-db-credentials
+                key: password
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 5000
+          failureThreshold: 30
+          periodSeconds: 2
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 5000
+          periodSeconds: 5
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 5000
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          failureThreshold: 3

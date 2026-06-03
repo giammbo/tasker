@@ -1,10 +1,22 @@
 # GitHub Actions workflow per Tasker.
 # Da git push su main, builda l'immagine arm64 (Graviton), la pusha su ECR
-# con tag = SHA del commit, e aggiorna il deployment su EKS.
+# con tag = SHA del commit, e aggiorna il Rollout (Argo Rollouts) su EKS.
 #
 # Autenticazione AWS: OIDC federation. NESSUNA chiave AWS statica nei Secrets
 # di GitHub. Il workflow assume il ruolo BreakingProdGitHubActionsRole, che
 # si fida solo dei push sul branch main di questo repository.
+#
+# NOTA (EP8): il workload e' un Rollout di Argo Rollouts, non un Deployment.
+# Il deploy usa `kubectl argo rollouts set image`, che fa partire la strategia
+# canary definita in tasker-rollout-argo.yaml. Il plugin argo rollouts va
+# installato nel runner (step dedicato sotto).
+#
+# MODELLO DI DEPLOY: la pipeline fa partire il canary e verifica che il primo
+# step diventi sano (pod canary healthy + smoke test). NON porta il rollout al
+# 100%: la promozione finale e' un gesto MANUALE, fatto da chi rilascia dopo
+# aver guardato l'app, con `kubectl argo rollouts promote tasker`. E' il punto
+# della EP8: la pipeline porta il canary fino al punto di controllo, l'umano
+# decide se completare.
 
 name: Deploy Tasker to EKS
 
@@ -18,7 +30,7 @@ on:
       - 'app.py'
       - 'requirements.txt'
       - 'Dockerfile'
-      - 'tasker-deployment-eks.yaml'
+      - 'tasker-rollout-argo.yaml'
       - '.github/workflows/deploy.yaml'
   # Bottone "Run workflow" manuale dalla UI di GitHub Actions.
   # Comodo per re-deploy senza commit, o per il primo run di test.
@@ -107,21 +119,47 @@ jobs:
           kubectl version --client
           kubectl get nodes
 
-      # 7. Aggiorna l'immagine del deployment Tasker e aspetta il rollout.
-      #    kubectl set image cambia SOLO il tag, niente apply del manifest:
-      #    pulito per i deploy di update.
-      - name: Deploy to EKS
+      # 7. Installa il plugin kubectl argo rollouts nel runner.
+      #    Serve per i comandi `kubectl argo rollouts` degli step successivi.
+      - name: Install kubectl argo rollouts plugin
+        run: |
+          set -euo pipefail
+          curl -sSL -o kubectl-argo-rollouts \
+            https://github.com/argoproj/argo-rollouts/releases/latest/download/kubectl-argo-rollouts-linux-amd64
+          chmod +x kubectl-argo-rollouts
+          sudo mv kubectl-argo-rollouts /usr/local/bin/kubectl-argo-rollouts
+          kubectl argo rollouts version
+
+      # 8. Aggiorna l'immagine del Rollout: fa partire la strategia canary.
+      #    `set image` cambia solo il tag; Argo Rollouts esegue gli step canary
+      #    (setWeight + pause) definiti in tasker-rollout-argo.yaml.
+      #    NON usiamo `rollouts status` qui: il manifest ha una pausa indefinita
+      #    (pause: {}) tra il 50% e il 100%, quindi il rollout NON si completa
+      #    da solo - aspetta una promozione manuale. Bloccare lo step in attesa
+      #    del completamento andrebbe in timeout.
+      #    Diamo solo il via al canary e proseguiamo allo smoke test.
+      - name: Start canary deploy
         run: |
           set -euo pipefail
           IMAGE="${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}"
-          echo "Deploying image: ${IMAGE}"
-          kubectl set image deployment/tasker tasker="${IMAGE}"
-          kubectl rollout status deployment/tasker --timeout=5m
+          echo "Avvio canary con immagine: ${IMAGE}"
+          kubectl argo rollouts set image tasker tasker="${IMAGE}"
+          # Aspetta che il canary raggiunga uno stato stabile parziale (pausa),
+          # cioe' che i pod canary siano healthy. Se i pod canary non diventano
+          # sani, questo va in errore e il workflow fallisce: e' il
+          # comportamento voluto (release rotta = pipeline rossa).
+          kubectl argo rollouts status tasker --timeout 300s || {
+            STATUS=$(kubectl argo rollouts status tasker --timeout 1s 2>&1 || true)
+            echo "Stato rollout: ${STATUS}"
+            # "Paused" e' uno stato ATTESO (pausa canary), non un errore.
+            echo "${STATUS}" | grep -qi "Paused" && echo "Canary in pausa, ok" && exit 0
+            echo "Canary non sano" >&2
+            exit 1
+          }
 
-      # 8. Smoke test: l'app risponde davvero dopo il deploy?
-      #    Se /health non ritorna "ok", il workflow fallisce e siamo avvisati
-      #    prima degli utenti. Le readinessProbe (EP6) impediscono comunque
-      #    che pod rotti ricevano traffico - questa e' una rete in piu'.
+      # 9. Smoke test sul canary: l'app risponde durante il canary?
+      #    Le readinessProbe (EP6) tengono comunque fuori dal Service i pod
+      #    canary non sani: questa e' una verifica in piu'.
       - name: Smoke test
         run: |
           set -euo pipefail
@@ -144,16 +182,23 @@ jobs:
           echo "Smoke test failed dopo 5 tentativi" >&2
           exit 1
 
-      # 9. Riepilogo nella UI di GitHub Actions: cosa e' stato deployato.
+      # 10. Riepilogo nella UI di GitHub Actions.
+      #     Il canary e' partito ed e' sano fino al punto di pausa. La
+      #     PROMOZIONE FINALE al 100% e' manuale:
+      #       kubectl argo rollouts promote tasker
+      #     (oppure abort: kubectl argo rollouts abort tasker)
       - name: Summary
         if: always()
         run: |
           {
-            echo "## Deploy summary"
+            echo "## Deploy summary (canary)"
             echo ""
             echo "- **Commit**: \`${{ github.sha }}\`"
             echo "- **Image**: \`${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}\`"
             echo "- **Cluster**: \`${{ env.EKS_CLUSTER_NAME }}\` (${{ env.AWS_REGION }})"
             echo "- **Triggered by**: \`${{ github.event_name }}\` from \`${{ github.actor }}\`"
+            echo ""
+            echo "Il canary e' partito ed e' sano fino al punto di pausa."
+            echo "Promozione finale manuale: \`kubectl argo rollouts promote tasker\`"
+            echo "Rollback: \`kubectl argo rollouts abort tasker\`"
           } >> "$GITHUB_STEP_SUMMARY"
-

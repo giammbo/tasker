@@ -1,0 +1,26 @@
+# Service per la demo blue/green a mano della EP8.
+# Il selector include `version: blue` -> il traffico va SOLO ai pod blue.
+# Lo switch a green si fa cambiando il selector:
+#
+#   kubectl patch service tasker-service \
+#     -p '{"spec":{"selector":{"app":"tasker","version":"green"}}}'
+#
+# Rollback: stesso patch con "version":"blue".
+#
+# NOTA: questo Service ha selector con `version`, per la demo blue/green.
+# E' alternativo a tasker-service-loadbalancer-eks.yaml (che seleziona solo
+# su app=tasker). Non applicarli insieme: gestiscono lo stesso Service
+# "tasker-service" in due modi diversi.
+apiVersion: v1
+kind: Service
+metadata:
+  name: tasker-service
+spec:
+  type: LoadBalancer
+  selector:
+    app: tasker
+    version: blue
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 5000

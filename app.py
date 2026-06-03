@@ -88,6 +88,7 @@ def build_db_url():
 DATABASE_URL = build_db_url()
 Base = declarative_base()
 
+app_version = os.getenv("APP_VERSION", "0.3.8")
 
 class Task(Base):
     __tablename__ = "tasks"
@@ -152,7 +153,7 @@ def health():
     return jsonify({
         "status": status,
         "service": "tasker",
-        "version": os.getenv("APP_VERSION", "0.3.0"),
+        "version": app_version,
         "hostname": os.getenv("HOSTNAME", "unknown"),
         "db": "ok" if db_ok else "unavailable",
     }), 200 if db_ok else 503
@@ -246,7 +247,7 @@ def delete_task(task_id):
 def index():
     return jsonify({
         "service": "tasker",
-        "version": "0.3.0",
+        "version": app_version,
         "message": "Tasker pipeline live — saluti da Breaking Prod EP7",
         "endpoints": {
             "GET /health": "health check (include stato DB)",

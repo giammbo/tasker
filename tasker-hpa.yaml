@@ -3,9 +3,12 @@ kind: HorizontalPodAutoscaler
 metadata:
   name: tasker-hpa
 spec:
+  # Con Argo Rollouts il target dell'HPA e' il Rollout, NON un Deployment.
+  # Se lasci kind: Deployment, l'HPA cerca un workload che non esiste piu'
+  # e non scala nulla.
   scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
+    apiVersion: argoproj.io/v1alpha1
+    kind: Rollout
     name: tasker
   minReplicas: 3
   maxReplicas: 10
@@ -21,3 +24,9 @@ spec:
       stabilizationWindowSeconds: 30
     scaleDown:
       stabilizationWindowSeconds: 300
+# NOTA (avanzata, non coperta in EP8): HPA + canary insieme vanno gestiti con
+# attenzione. Durante un rollout canary e' Argo Rollouts a controllare il
+# numero di repliche; l'HPA agisce sul totale e i due possono interferire.
+# Argo Rollouts supporta l'HPA sul Rollout, ma per una demo canary pulita
+# conviene NON applicare l'HPA (o tenerlo, sapendo che durante il canary il
+# conteggio repliche e' guidato dagli step). Tema per una puntata futura.
